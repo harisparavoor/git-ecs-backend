@@ -35,7 +35,7 @@ env:
   ECS_SERVICE: "${{ vars.project_name }}-${{ vars.environment }}-${{ vars.app }}-service"
   ECS_TASK_DEFINITION_FAMILY: "${{ vars.project_name }}-${{ vars.app }}-${{ vars.environment }}"
   ECS_CONTAINER_NAME: ${{ vars.app }}
-  ECR_REPOSITORY: ${{ vars.backend_repository_name }}
+  ECR_REPOSITORY: "${{ vars.project_name }}-${{ vars.app }}-${{ vars.environment }}"
 
 jobs:
   deploy:
