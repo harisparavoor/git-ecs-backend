@@ -1,0 +1,143 @@
+name: Build and Deploy Backend to ECS
+
+# Trigger: runs automatically on a push to ANY branch. No branch name is
+# hardcoded here -- whichever branch receives the push is the one that
+# triggers this workflow and gets built/deployed.
+on:
+  push: {}
+
+# Required for requesting the OIDC token used to assume the AWS IAM role.
+permissions:
+  id-token: write
+  contents: read
+
+# ---------------------------------------------------------------------------
+# ALL environment-specific values below are read from GitHub repo/org
+# "Variables" (vars.*) or "Secrets" (secrets.*). Nothing is hardcoded.
+#
+# Configure these in: Repo -> Settings -> Secrets and variables -> Actions
+#
+# Variables tab (non-sensitive):
+#   AWS_REGION                  e.g. us-east-1
+#   project_name                e.g. git-act-ecs-app
+#   environment                 e.g. dev / staging / prod
+#   app                         e.g. backend
+#   backend_repository_name     ECR repo name for this app
+#
+# Secrets tab (sensitive):
+#   AWS_ROLE_ARN                 IAM role ARN GitHub OIDC will assume
+#     (must trust token.actions.githubusercontent.com for this repo)
+# ---------------------------------------------------------------------------
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECS_CLUSTER: "${{ vars.project_name }}-${{ vars.environment }}-cluster"
+  ECS_SERVICE: "${{ vars.project_name }}-${{ vars.environment }}-${{ vars.app }}-service"
+  ECS_TASK_DEFINITION_FAMILY: "${{ vars.project_name }}-${{ vars.app }}-${{ vars.environment }}"
+  ECS_CONTAINER_NAME: ${{ vars.app }}
+  ECR_REPOSITORY: ${{ vars.backend_repository_name }}
+
+jobs:
+  deploy:
+    name: Build, Push & Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      # -----------------------------------------------------------------
+      # 0. Fail fast if any required repo Variable/Secret is missing.
+      # -----------------------------------------------------------------
+      - name: Validate required configuration
+        shell: bash
+        env:
+          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+        run: |
+          set -euo pipefail
+          missing=0
+          check() {
+            if [ -z "${!1:-}" ]; then
+              echo "ERROR: required value '$1' is empty or not configured."
+              missing=1
+            fi
+          }
+          check AWS_REGION
+          check ECR_REPOSITORY
+          check ECS_CLUSTER
+          check ECS_SERVICE
+          check ECS_TASK_DEFINITION_FAMILY
+          check ECS_CONTAINER_NAME
+          check AWS_ROLE_ARN
+          if [ "$missing" -eq 1 ]; then
+            echo "One or more required GitHub Variables/Secrets are missing. Aborting."
+            exit 1
+          fi
+          echo "All required configuration values are present."
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------
+      # AWS auth via OIDC -- no long-lived access keys stored anywhere.
+      # -----------------------------------------------------------------
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # -----------------------------------------------------------------
+      # Build & push the Docker image. The Dockerfile already runs
+      # "mvn clean package" internally, so no separate Maven build step
+      # is needed on the runner -- Docker owns the whole build.
+      # Tagged with the short commit hash, plus :latest.
+      # -----------------------------------------------------------------
+      - name: Build, tag and push image to Amazon ECR
+        id: build-image
+        shell: bash
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: |
+          set -euo pipefail
+          REPOSITORY_URI="$ECR_REGISTRY/$ECR_REPOSITORY"
+          COMMIT_HASH=$(echo "$GITHUB_SHA" | cut -c1-7)
+          IMAGE_TAG="${COMMIT_HASH:-latest}"
+
+          docker build -t "$REPOSITORY_URI:latest" .
+          docker tag "$REPOSITORY_URI:latest" "$REPOSITORY_URI:$IMAGE_TAG"
+
+          docker push "$REPOSITORY_URI:latest"
+          docker push "$REPOSITORY_URI:$IMAGE_TAG"
+
+          echo "image_uri=$REPOSITORY_URI:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------
+      # Pull the CURRENT live task definition from ECS, so nothing about
+      # its shape needs to be duplicated/hardcoded here.
+      # -----------------------------------------------------------------
+      - name: Download current ECS task definition
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws ecs describe-task-definition \
+            --task-definition "$ECS_TASK_DEFINITION_FAMILY" \
+            --query "taskDefinition" \
+            --output json > task-definition.json
+
+      - name: Update image ID in task definition
+        id: render-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.ECS_CONTAINER_NAME }}
+          image: ${{ steps.build-image.outputs.image_uri }}
+
+      - name: Deploy new task definition to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-task-def.outputs.task-definition }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          service: ${{ env.ECS_SERVICE }}
+          wait-for-service-stability: true
